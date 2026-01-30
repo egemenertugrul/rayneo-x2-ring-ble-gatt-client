@@ -16,8 +16,12 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from typing import Optional
+
+# Set to True or RING_BLE_NOTIFY_VERBOSE=1 to print every notification (noisy)
+NOTIFY_VERBOSE = os.environ.get("RING_BLE_NOTIFY_VERBOSE", "").lower() in ("1", "true", "yes")
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.characteristic import BleakGATTCharacteristic
@@ -45,7 +49,8 @@ CCCD_NOTIFY_ENABLE = bytes([0x01, 0x00])
 
 def notification_handler(characteristic: BleakGATTCharacteristic, data: bytearray) -> None:
     """Handle incoming notifications from the device."""
-    print(f"[Notify] {characteristic.uuid} (handle={characteristic.handle}) data={data.hex()} ({list(data)})")
+    if NOTIFY_VERBOSE:
+        print(f"[Notify] {characteristic.uuid} (handle={characteristic.handle}) data={data.hex()} ({list(data)})")
 
 
 async def find_hid_device(name_or_address: Optional[str] = None, timeout: float = 10.0):
