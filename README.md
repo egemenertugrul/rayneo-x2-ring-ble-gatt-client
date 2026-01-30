@@ -35,6 +35,13 @@ python main.py AA:BB:CC:DD:EE:FF
 python main.py "Your Ring Name"
 ```
 
+<p align="center">
+  <img width="240" alt="ring0"
+       src="https://github.com/user-attachments/assets/928e808d-7974-4653-b82d-0de9f5675348" />
+  <img width="240" alt="ring1"
+       src="https://github.com/user-attachments/assets/ba9695bf-35bc-4eec-a2a7-f5facb6e526d" />
+</p>
+
 ### With OSCQuery (live values in Chataigne, etc.)
 
 ```bash
