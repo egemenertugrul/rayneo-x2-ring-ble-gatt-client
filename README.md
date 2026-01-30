@@ -1,5 +1,10 @@
 # RayNeo X2 Smart Ring – BLE client
 
+<p align="center">
+  <img width="165" height="165" alt="ring"
+       src="https://github.com/user-attachments/assets/1549785d-6e3c-4950-83c1-308bdb880e8e" />
+</p>
+
 Headless BLE client for the **RayNeo X2 Smart Ring**. Connects over vendor GATT; also supports standard HID over GATT (HOGP) for other devices.
 
 - **Ring-only use**: Does not require RayNeo X2 glasses; you can use the ring on its own.
