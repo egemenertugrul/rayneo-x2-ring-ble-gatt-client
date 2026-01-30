@@ -10,6 +10,7 @@ Headless BLE client for the **RayNeo X2 Smart Ring**. Connects over vendor GATT;
 - **Ring-only use**: Does not require RayNeo X2 glasses; you can use the ring on its own.
 - **Headless**: No GUI; run from the command line or in scripts/automation.
 - **Uses GATT**: Discovers services/characteristics, enables notifications, and prints incoming data.
+- **OSCQuery**: Optional script exposes ring data (X, Y, press) via OSCQuery + WebSocket so clients (e.g. Chataigne) get live updates without polling.
 
 ## Requirements
 
@@ -19,13 +20,29 @@ Headless BLE client for the **RayNeo X2 Smart Ring**. Connects over vendor GATT;
 
 ## Usage
 
+### BLE only
+
+```bash
 pip install bleak
 
 # Connect to default device (RayNeo X2 ring at B0:B3:53:EB:40:8D)
-python hid_gatt_client.py
+python main.py
 
 # Connect by address
-python hid_gatt_client.py AA:BB:CC:DD:EE:FF
+python main.py AA:BB:CC:DD:EE:FF
 
 # Connect by device name
-python hid_gatt_client.py "Your Ring Name"
+python main.py "Your Ring Name"
+```
+
+### With OSCQuery (live values in Chataigne, etc.)
+
+```bash
+pip install -r requirements.txt
+
+python run_ring_oscquery.py              # default device
+python run_ring_oscquery.py AA:BB:CC:DD:EE:FF
+python run_ring_oscquery.py "Your Ring Name"
+```
+
+OSCQuery server runs at `http://127.0.0.1:9020`; nodes: `/ring/X`, `/ring/Y`, `/ring/press`. Connect via OSCQuery in your host app to get live updates over WebSocket.
