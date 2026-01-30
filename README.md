@@ -4,7 +4,7 @@ Headless BLE client for the **RayNeo X2 Smart Ring**. Connects over vendor GATT;
 
 - **Ring-only use**: Does not require RayNeo X2 glasses; you can use the ring on its own.
 - **Headless**: No GUI; run from the command line or in scripts/automation.
-- **Uses GATT** — Discovers services/characteristics, enables notifications, and prints incoming data.
+- **Uses GATT**: Discovers services/characteristics, enables notifications, and prints incoming data.
 
 ## Requirements
 
