@@ -111,6 +111,8 @@ async def _keepalive_loop(
     char: BleakGATTCharacteristic,
     is_connected: Callable[[], bool],
     log_battery: bool = False,
+    battery_state: Optional[dict] = None,
+    on_battery_updated: Optional[Callable[[int], None]] = None,
 ) -> None:
     """Background task: periodically read the given characteristic while connected. Exits when disconnected."""
     while is_connected() and interval_sec > 0:
@@ -119,14 +121,49 @@ async def _keepalive_loop(
             if not is_connected():
                 break
             data = await client.read_gatt_char(char.uuid)
-            if log_battery and data is not None and len(data) >= 1:
+            if data is not None and len(data) >= 1:
                 level = min(100, max(0, int(data[0])))
-                print(f"Battery: {level}%")
+                if battery_state is not None:
+                    if level != battery_state.get("last"):
+                        print(f"Battery: {level}%")
+                        battery_state["last"] = level
+                    if on_battery_updated is not None:
+                        on_battery_updated(level)
+                elif log_battery:
+                    print(f"Battery: {level}%")
         except asyncio.CancelledError:
             break
         except Exception as e:
             if is_connected():
                 print(f"Keepalive read failed: {e}")
+
+
+async def _battery_poll_loop(
+    client: BleakClient,
+    battery_char: BleakGATTCharacteristic,
+    interval_sec: float,
+    is_connected: Callable[[], bool],
+    battery_state: dict,
+    on_battery_updated: Optional[Callable[[int], None]] = None,
+) -> None:
+    """Dedicated task: periodically read battery characteristic. Exits when disconnected."""
+    while is_connected() and interval_sec > 0:
+        try:
+            await asyncio.sleep(interval_sec)
+            if not is_connected():
+                break
+            level = await _read_battery_level(client, battery_char)
+            if level is not None:
+                if level != battery_state.get("last"):
+                    print(f"Battery: {level}%")
+                    battery_state["last"] = level
+                if on_battery_updated is not None:
+                    on_battery_updated(level)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            if is_connected():
+                print(f"Battery poll failed: {e}")
 
 
 async def find_hid_device(name_or_address: Optional[str] = None, timeout: float = 10.0):
@@ -145,6 +182,8 @@ async def run_hid_client(
     *,
     keepalive_interval: float = 0,
     keepalive_mode: str = "battery",
+    battery_poll_interval: float = 60.0,
+    on_battery_updated: Optional[Callable[[int], None]] = None,
 ) -> None:
     """
     Connect to a HID device, enable Report notifications, and send Exit Suspend.
@@ -154,6 +193,8 @@ async def run_hid_client(
 
     keepalive_interval: seconds between keepalive reads (0 = disabled).
     keepalive_mode: which characteristic to use for keepalive (battery, read-report, vendor).
+    battery_poll_interval: seconds between battery reads when battery char exists (0 = disabled, default 60).
+    on_battery_updated: optional callback(level: int) when battery level is read or changes.
     """
     target = address_or_name if address_or_name else DEFAULT_DEVICE_ADDRESS
     device = await find_hid_device(target)
@@ -246,12 +287,30 @@ async def run_hid_client(
                     except Exception as e:
                         print(f"  Read {char.uuid} failed: {e}")
 
-        # Battery: standard service first, then optional vendor heuristic
+        # Battery: standard service first, then optional vendor heuristic; track changes and notify callback
+        battery_state: dict = {"last": None}
         battery_char = _find_battery_char(client)
         if battery_char:
             level = await _read_battery_level(client, battery_char)
             if level is not None:
+                battery_state["last"] = level
                 print(f"Battery: {level}%")
+                if on_battery_updated is not None:
+                    on_battery_updated(level)
+            # Enable battery notifications if supported so we get updates as they happen
+            if battery_char.properties and ("notify" in battery_char.properties or "indicate" in battery_char.properties):
+                def _battery_notification_handler(characteristic: BleakGATTCharacteristic, data: bytearray) -> None:
+                    if data is not None and len(data) >= 1:
+                        level_val = min(100, max(0, int(data[0])))
+                        if level_val != battery_state.get("last"):
+                            print(f"Battery: {level_val}%")
+                            battery_state["last"] = level_val
+                        if on_battery_updated is not None:
+                            on_battery_updated(level_val)
+                try:
+                    await client.start_notify(battery_char.uuid, _battery_notification_handler)
+                except Exception as e:
+                    print(f"Battery notifications not enabled: {e}")
         else:
             # Vendor fallback: try first readable char in vendor services; if single byte 0-100, log as possible battery
             vendor_uuids = ("0000ae40", "0000ae00", "0000fff0")
@@ -266,6 +325,8 @@ async def run_hid_client(
                         value = await client.read_gatt_char(char.uuid)
                         if value is not None and len(value) == 1 and 0 <= value[0] <= 100:
                             print(f"Possible battery (vendor {char.uuid}): {value[0]}%")
+                            if on_battery_updated is not None:
+                                on_battery_updated(value[0])
                     except Exception:
                         pass
                     break
@@ -276,6 +337,7 @@ async def run_hid_client(
 
         print("Running. Press Ctrl+C to disconnect.")
         keepalive_task = None
+        battery_poll_task = None
         if keepalive_interval > 0 and keepalive_char:
             keepalive_task = asyncio.create_task(
                 _keepalive_loop(
@@ -284,6 +346,19 @@ async def run_hid_client(
                     keepalive_char,
                     lambda: client.is_connected,
                     log_battery=log_battery_on_keepalive,
+                    battery_state=battery_state if battery_char else None,
+                    on_battery_updated=on_battery_updated,
+                )
+            )
+        if battery_poll_interval > 0 and battery_char is not None:
+            battery_poll_task = asyncio.create_task(
+                _battery_poll_loop(
+                    client,
+                    battery_char,
+                    battery_poll_interval,
+                    lambda: client.is_connected,
+                    battery_state,
+                    on_battery_updated=on_battery_updated,
                 )
             )
         try:
@@ -298,6 +373,12 @@ async def run_hid_client(
                     await keepalive_task
                 except asyncio.CancelledError:
                     pass
+            if battery_poll_task is not None:
+                battery_poll_task.cancel()
+                try:
+                    await battery_poll_task
+                except asyncio.CancelledError:
+                    pass
         print("Disconnecting...")
 
 
@@ -307,6 +388,8 @@ async def run_hid_client_with_reconnect(
     reconnect_delay: float = 3.0,
     keepalive_interval: float = 0,
     keepalive_mode: str = "battery",
+    battery_poll_interval: float = 60.0,
+    on_battery_updated: Optional[Callable[[int], None]] = None,
 ) -> None:
     """
     Run the HID client indefinitely, reconnecting after disconnect.
@@ -314,6 +397,8 @@ async def run_hid_client_with_reconnect(
     reconnect_delay: seconds to wait before reconnecting (default 3).
     keepalive_interval: seconds between keepalive reads (0 = disabled).
     keepalive_mode: which characteristic to use for keepalive (battery, read-report, vendor).
+    battery_poll_interval: seconds between battery reads when battery char exists (0 = disabled, default 60).
+    on_battery_updated: optional callback(level: int) when battery level is read or changes.
     """
     target = address_or_name if address_or_name else DEFAULT_DEVICE_ADDRESS
     while True:
@@ -322,6 +407,8 @@ async def run_hid_client_with_reconnect(
                 address_or_name,
                 keepalive_interval=keepalive_interval,
                 keepalive_mode=keepalive_mode,
+                battery_poll_interval=battery_poll_interval,
+                on_battery_updated=on_battery_updated,
             )
         except asyncio.CancelledError:
             raise
@@ -365,6 +452,12 @@ def main() -> None:
         default=os.environ.get("RING_BLE_KEEPALIVE_MODE", "battery"),
         help="Characteristic to use for keepalive (default: battery, env: RING_BLE_KEEPALIVE_MODE)",
     )
+    parser.add_argument(
+        "--battery-poll-interval",
+        type=float,
+        default=float(os.environ.get("RING_BLE_BATTERY_POLL_INTERVAL", "60")),
+        help="Seconds between battery reads when battery char exists; 0 = disabled (default: 60, env: RING_BLE_BATTERY_POLL_INTERVAL)",
+    )
     args = parser.parse_args()
 
     asyncio.run(
@@ -373,6 +466,7 @@ def main() -> None:
             reconnect_delay=args.reconnect_delay,
             keepalive_interval=args.keepalive_interval,
             keepalive_mode=args.keepalive_mode,
+            battery_poll_interval=args.battery_poll_interval,
         )
     )
 

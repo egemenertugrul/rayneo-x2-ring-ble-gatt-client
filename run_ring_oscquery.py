@@ -12,8 +12,8 @@ Usage:
   python run_ring_oscquery.py AA:BB:CC:DD:EE:FF  # connect by address
   python run_ring_oscquery.py "My Ring"          # connect by name
 
-  Env: RING_BLE_RECONNECT_DELAY, RING_BLE_KEEPALIVE_INTERVAL, RING_BLE_KEEPALIVE_MODE
-  (same as main.py; see main.py --help for defaults).
+  Env: RING_BLE_RECONNECT_DELAY, RING_BLE_KEEPALIVE_INTERVAL, RING_BLE_KEEPALIVE_MODE,
+  RING_BLE_BATTERY_POLL_INTERVAL (same as main.py; see main.py --help for defaults).
 """
 
 from __future__ import annotations
@@ -49,7 +49,10 @@ def _create_oscquery_service_and_nodes():
     node_press = OSCQueryNode(
         full_path="/ring/press", value=[0], type_=[int], access=OSCAccess.READWRITE_VALUE
     )
-    for node in (node_x, node_y, node_press):
+    node_battery = OSCQueryNode(
+        full_path="/ring/battery", value=[0], type_=[int], access=OSCAccess.READWRITE_VALUE
+    )
+    for node in (node_x, node_y, node_press, node_battery):
         service.add_node(node)
 
     return service
@@ -110,9 +113,15 @@ def main():
         print(f"WebSocket on same port (OSCQuery spec): ws://127.0.0.1:{_service.wsPort} — use LISTEN to get live updates")
     else:
         print(f"WebSocket for live value updates: ws://127.0.0.1:{_service.wsPort} (in HOST_INFO)")
-    print("Ring nodes: /ring/X, /ring/Y, /ring/press")
+    print("Ring nodes: /ring/X, /ring/Y, /ring/press, /ring/battery")
     original_handler = main_module.notification_handler
     main_module.notification_handler = _make_notification_wrapper(original_handler, _service)
+
+    def _on_battery_updated(level: int) -> None:
+        try:
+            _service.update_value("/ring/battery", level)
+        except Exception as e:
+            print(f"[OSCQuery] Battery update failed: {e}")
     print("Notification handler wrapped: BLE updates will be pushed to OSCQuery nodes.")
     print("Press Ctrl+C to disconnect and exit.")
 
@@ -123,6 +132,7 @@ def main():
     reconnect_delay = float(os.environ.get("RING_BLE_RECONNECT_DELAY", "3"))
     keepalive_interval = float(os.environ.get("RING_BLE_KEEPALIVE_INTERVAL", "0"))
     keepalive_mode = os.environ.get("RING_BLE_KEEPALIVE_MODE", "battery")
+    battery_poll_interval = float(os.environ.get("RING_BLE_BATTERY_POLL_INTERVAL", "60"))
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -132,6 +142,8 @@ def main():
             reconnect_delay=reconnect_delay,
             keepalive_interval=keepalive_interval,
             keepalive_mode=keepalive_mode,
+            battery_poll_interval=battery_poll_interval,
+            on_battery_updated=_on_battery_updated,
         )
     )
 
