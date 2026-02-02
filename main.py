@@ -120,6 +120,7 @@ async def _keepalive_loop(
             await asyncio.sleep(interval_sec)
             if not is_connected():
                 break
+            print("[Keepalive] sending read")
             data = await client.read_gatt_char(char.uuid)
             if data is not None and len(data) >= 1:
                 level = min(100, max(0, int(data[0])))
@@ -180,7 +181,7 @@ async def find_hid_device(name_or_address: Optional[str] = None, timeout: float 
 async def run_hid_client(
     address_or_name: Optional[str] = None,
     *,
-    keepalive_interval: float = 0,
+    keepalive_interval: float = 5.0,
     keepalive_mode: str = "battery",
     battery_poll_interval: float = 60.0,
     on_battery_updated: Optional[Callable[[int], None]] = None,
@@ -191,7 +192,7 @@ async def run_hid_client(
     Pass a BLE address (e.g. "AA:BB:CC:DD:EE:FF") or device name to connect.
     If None, the first device advertising HID service (0x1812) will be used.
 
-    keepalive_interval: seconds between keepalive reads (0 = disabled).
+    keepalive_interval: seconds between keepalive reads (0 = disabled, default 5).
     keepalive_mode: which characteristic to use for keepalive (battery, read-report, vendor).
     battery_poll_interval: seconds between battery reads when battery char exists (0 = disabled, default 60).
     on_battery_updated: optional callback(level: int) when battery level is read or changes.
@@ -386,7 +387,7 @@ async def run_hid_client_with_reconnect(
     address_or_name: Optional[str] = None,
     *,
     reconnect_delay: float = 3.0,
-    keepalive_interval: float = 0,
+    keepalive_interval: float = 5.0,
     keepalive_mode: str = "battery",
     battery_poll_interval: float = 60.0,
     on_battery_updated: Optional[Callable[[int], None]] = None,
@@ -395,7 +396,7 @@ async def run_hid_client_with_reconnect(
     Run the HID client indefinitely, reconnecting after disconnect.
 
     reconnect_delay: seconds to wait before reconnecting (default 3).
-    keepalive_interval: seconds between keepalive reads (0 = disabled).
+    keepalive_interval: seconds between keepalive reads (0 = disabled, default 5).
     keepalive_mode: which characteristic to use for keepalive (battery, read-report, vendor).
     battery_poll_interval: seconds between battery reads when battery char exists (0 = disabled, default 60).
     on_battery_updated: optional callback(level: int) when battery level is read or changes.
@@ -443,8 +444,8 @@ def main() -> None:
     parser.add_argument(
         "--keepalive-interval",
         type=float,
-        default=float(os.environ.get("RING_BLE_KEEPALIVE_INTERVAL", "0")),
-        help="Seconds between keepalive reads; 0 = disabled (default, env: RING_BLE_KEEPALIVE_INTERVAL)",
+        default=float(os.environ.get("RING_BLE_KEEPALIVE_INTERVAL", "5")),
+        help="Seconds between keepalive reads; 0 = disabled (default: 5, env: RING_BLE_KEEPALIVE_INTERVAL)",
     )
     parser.add_argument(
         "--keepalive-mode",

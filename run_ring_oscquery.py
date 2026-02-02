@@ -8,16 +8,18 @@ as OSCQuery nodes so clients can discover and read them via OSCQuery only.
 
 Usage:
   pip install -r requirements.txt
-  python run_ring_oscquery.py                    # connect to default device (auto-reconnect)
-  python run_ring_oscquery.py AA:BB:CC:DD:EE:FF  # connect by address
-  python run_ring_oscquery.py "My Ring"          # connect by name
+  python run_ring_oscquery.py                                    # connect to default device (auto-reconnect)
+  python run_ring_oscquery.py AA:BB:CC:DD:EE:FF                  # connect by address
+  python run_ring_oscquery.py "My Ring" --keepalive-interval 15  # keepalive every 15s to prevent ring sleep
+  python run_ring_oscquery.py --help                            # show all options
 
-  Env: RING_BLE_RECONNECT_DELAY, RING_BLE_KEEPALIVE_INTERVAL, RING_BLE_KEEPALIVE_MODE,
-  RING_BLE_BATTERY_POLL_INTERVAL (same as main.py; see main.py --help for defaults).
+  Options can also be set via env: RING_BLE_RECONNECT_DELAY, RING_BLE_KEEPALIVE_INTERVAL,
+  RING_BLE_KEEPALIVE_MODE, RING_BLE_BATTERY_POLL_INTERVAL (CLI overrides env).
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
 import signal
@@ -58,7 +60,7 @@ def _create_oscquery_service_and_nodes():
     return service
 
 
-def _make_notification_wrapper(original_handler, service, debug=True):
+def _make_notification_wrapper(original_handler, service, debug=False):
     """Return a wrapper that calls the original handler and updates OSCQuery nodes via service.update_value()."""
 
     def wrapper(characteristic, data: bytearray):
@@ -125,14 +127,46 @@ def main():
     print("Notification handler wrapped: BLE updates will be pushed to OSCQuery nodes.")
     print("Press Ctrl+C to disconnect and exit.")
 
-    addr_or_name = None
-    if len(sys.argv) > 1:
-        addr_or_name = sys.argv[1]
+    parser = argparse.ArgumentParser(
+        description="RayNeo X2 Ring BLE client with OSCQuery. Options match main.py (env as defaults)."
+    )
+    parser.add_argument(
+        "device",
+        nargs="?",
+        default=None,
+        help="BLE address (AA:BB:CC:DD:EE:FF) or device name. Default: use default from main.py",
+    )
+    parser.add_argument(
+        "--reconnect-delay",
+        type=float,
+        default=float(os.environ.get("RING_BLE_RECONNECT_DELAY", "3")),
+        help="Seconds before reconnecting after disconnect (default: 3, env: RING_BLE_RECONNECT_DELAY)",
+    )
+    parser.add_argument(
+        "--keepalive-interval",
+        type=float,
+        default=float(os.environ.get("RING_BLE_KEEPALIVE_INTERVAL", "5")),
+        help="Seconds between keepalive reads; 0 = disabled (default: 5, env: RING_BLE_KEEPALIVE_INTERVAL)",
+    )
+    parser.add_argument(
+        "--keepalive-mode",
+        choices=["battery", "read-report", "vendor"],
+        default=os.environ.get("RING_BLE_KEEPALIVE_MODE", "battery"),
+        help="Characteristic for keepalive (default: battery, env: RING_BLE_KEEPALIVE_MODE)",
+    )
+    parser.add_argument(
+        "--battery-poll-interval",
+        type=float,
+        default=float(os.environ.get("RING_BLE_BATTERY_POLL_INTERVAL", "60")),
+        help="Seconds between battery reads; 0 = disabled (default: 60, env: RING_BLE_BATTERY_POLL_INTERVAL)",
+    )
+    args = parser.parse_args()
 
-    reconnect_delay = float(os.environ.get("RING_BLE_RECONNECT_DELAY", "3"))
-    keepalive_interval = float(os.environ.get("RING_BLE_KEEPALIVE_INTERVAL", "0"))
-    keepalive_mode = os.environ.get("RING_BLE_KEEPALIVE_MODE", "battery")
-    battery_poll_interval = float(os.environ.get("RING_BLE_BATTERY_POLL_INTERVAL", "60"))
+    addr_or_name = args.device
+    reconnect_delay = args.reconnect_delay
+    keepalive_interval = args.keepalive_interval
+    keepalive_mode = args.keepalive_mode
+    battery_poll_interval = args.battery_poll_interval
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
