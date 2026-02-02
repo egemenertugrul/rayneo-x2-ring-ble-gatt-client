@@ -6,26 +6,31 @@ Replicates the Android Bluetooth stack logic when connecting to a HID device
 (e.g. smart ring): discover HID service, enable Report notifications,
 write Exit Suspend to HID Control Point, and handle incoming reports.
 
+Supports battery level reading, optional periodic keepalives, and automatic
+reconnect on disconnect.
+
 Usage:
   pip install bleak
-  python hid_gatt_client.py                    # connect to default device (B0:B3:53:EB:40:8D)
-  python hid_gatt_client.py AA:BB:CC:DD:EE:FF # connect by address
-  python hid_gatt_client.py "My Ring"         # connect by name
+  python main.py                                    # connect to default device, reconnect every 3s
+  python main.py AA:BB:CC:DD:EE:FF                 # connect by address
+  python main.py "My Ring" --keepalive-interval 30  # enable keepalive every 30s
+  python main.py --reconnect-delay 5                # reconnect after 5s (default 3)
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
 import sys
-from typing import Optional
+from typing import Callable, Optional
 
 # Set to True or RING_BLE_NOTIFY_VERBOSE=1 to print every notification (noisy)
 NOTIFY_VERBOSE = os.environ.get("RING_BLE_NOTIFY_VERBOSE", "").lower() in ("1", "true", "yes")
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.characteristic import BleakGATTCharacteristic
-
+from bleak.exc import BleakError
 
 # Default HID device address (smart ring)
 DEFAULT_DEVICE_ADDRESS = "B0:B3:53:EB:40:8D"
@@ -46,11 +51,82 @@ HID_CONTROL_POINT_EXIT_SUSPEND = bytes([0x01])
 # CCCD value: enable notification (little-endian 0x0001)
 CCCD_NOTIFY_ENABLE = bytes([0x01, 0x00])
 
+# Standard Battery Service (BLE GATT)
+BATTERY_SERVICE_UUID = "0000180f-0000-1000-8000-00805f9b34fb"
+BATTERY_LEVEL_CHAR_UUID = "00002a19-0000-1000-8000-00805f9b34fb"
+
 
 def notification_handler(characteristic: BleakGATTCharacteristic, data: bytearray) -> None:
     """Handle incoming notifications from the device."""
     if NOTIFY_VERBOSE:
         print(f"[Notify] {characteristic.uuid} (handle={characteristic.handle}) data={data.hex()} ({list(data)})")
+
+
+def _find_battery_char(client: BleakClient) -> Optional[BleakGATTCharacteristic]:
+    """Find standard Battery Level characteristic from client.services. Returns None if not found."""
+    for service in client.services:
+        if not service.uuid or service.uuid.lower().replace("-", "") != BATTERY_SERVICE_UUID.replace("-", ""):
+            continue
+        for char in service.characteristics:
+            if char.uuid and char.uuid.lower().replace("-", "") == BATTERY_LEVEL_CHAR_UUID.replace("-", ""):
+                if "read" in (char.properties or []):
+                    return char
+    return None
+
+
+async def _read_battery_level(client: BleakClient, char: BleakGATTCharacteristic) -> Optional[int]:
+    """Read battery level characteristic; return 0-100 or None on failure."""
+    try:
+        value = await client.read_gatt_char(char.uuid)
+        if value is not None and len(value) >= 1:
+            return min(100, max(0, int(value[0])))
+    except Exception:
+        pass
+    return None
+
+
+def _pick_keepalive_char(
+    client: BleakClient,
+    battery_char: Optional[BleakGATTCharacteristic],
+    keepalive_mode: str,
+) -> Optional[BleakGATTCharacteristic]:
+    """Pick a safe characteristic for periodic keepalive reads. Prefer battery if mode is battery and available."""
+    if keepalive_mode == "battery" and battery_char is not None:
+        return battery_char
+    # Fallback: first readable characteristic that is not HID Control Point
+    for service in client.services:
+        for char in service.characteristics:
+            if "read" not in (char.properties or []):
+                continue
+            uuid_lower = (char.uuid or "").lower()
+            if uuid_lower == HID_CHAR_UUIDS["control_point"]:
+                continue
+            return char
+    return battery_char
+
+
+async def _keepalive_loop(
+    client: BleakClient,
+    interval_sec: float,
+    char: BleakGATTCharacteristic,
+    is_connected: Callable[[], bool],
+    log_battery: bool = False,
+) -> None:
+    """Background task: periodically read the given characteristic while connected. Exits when disconnected."""
+    while is_connected() and interval_sec > 0:
+        try:
+            await asyncio.sleep(interval_sec)
+            if not is_connected():
+                break
+            data = await client.read_gatt_char(char.uuid)
+            if log_battery and data is not None and len(data) >= 1:
+                level = min(100, max(0, int(data[0])))
+                print(f"Battery: {level}%")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            if is_connected():
+                print(f"Keepalive read failed: {e}")
 
 
 async def find_hid_device(name_or_address: Optional[str] = None, timeout: float = 10.0):
@@ -64,18 +140,26 @@ async def find_hid_device(name_or_address: Optional[str] = None, timeout: float 
     return device
 
 
-async def run_hid_client(address_or_name: Optional[str] = None):
+async def run_hid_client(
+    address_or_name: Optional[str] = None,
+    *,
+    keepalive_interval: float = 0,
+    keepalive_mode: str = "battery",
+) -> None:
     """
     Connect to a HID device, enable Report notifications, and send Exit Suspend.
 
     Pass a BLE address (e.g. "AA:BB:CC:DD:EE:FF") or device name to connect.
     If None, the first device advertising HID service (0x1812) will be used.
+
+    keepalive_interval: seconds between keepalive reads (0 = disabled).
+    keepalive_mode: which characteristic to use for keepalive (battery, read-report, vendor).
     """
     target = address_or_name if address_or_name else DEFAULT_DEVICE_ADDRESS
     device = await find_hid_device(target)
     if device is None and not address_or_name:
         print(f"Default device not found: {DEFAULT_DEVICE_ADDRESS}")
-        print("Specify an address: python hid_gatt_client.py AA:BB:CC:DD:EE:FF")
+        print("Specify an address: python main.py AA:BB:CC:DD:EE:FF")
         return
 
     if device is None:
@@ -162,20 +246,135 @@ async def run_hid_client(address_or_name: Optional[str] = None):
                     except Exception as e:
                         print(f"  Read {char.uuid} failed: {e}")
 
+        # Battery: standard service first, then optional vendor heuristic
+        battery_char = _find_battery_char(client)
+        if battery_char:
+            level = await _read_battery_level(client, battery_char)
+            if level is not None:
+                print(f"Battery: {level}%")
+        else:
+            # Vendor fallback: try first readable char in vendor services; if single byte 0-100, log as possible battery
+            vendor_uuids = ("0000ae40", "0000ae00", "0000fff0")
+            for service in client.services:
+                suuid = (service.uuid or "").lower().replace("-", "")
+                if not any(suuid.startswith(u.replace("-", "")) for u in vendor_uuids):
+                    continue
+                for char in service.characteristics:
+                    if "read" not in (char.properties or []):
+                        continue
+                    try:
+                        value = await client.read_gatt_char(char.uuid)
+                        if value is not None and len(value) == 1 and 0 <= value[0] <= 100:
+                            print(f"Possible battery (vendor {char.uuid}): {value[0]}%")
+                    except Exception:
+                        pass
+                    break
+                break
+
+        keepalive_char = _pick_keepalive_char(client, battery_char, keepalive_mode)
+        log_battery_on_keepalive = keepalive_mode == "battery" and battery_char is not None
+
         print("Running. Press Ctrl+C to disconnect.")
+        keepalive_task = None
+        if keepalive_interval > 0 and keepalive_char:
+            keepalive_task = asyncio.create_task(
+                _keepalive_loop(
+                    client,
+                    keepalive_interval,
+                    keepalive_char,
+                    lambda: client.is_connected,
+                    log_battery=log_battery_on_keepalive,
+                )
+            )
         try:
             while client.is_connected:
                 await asyncio.sleep(1.0)
         except asyncio.CancelledError:
             pass
+        finally:
+            if keepalive_task is not None:
+                keepalive_task.cancel()
+                try:
+                    await keepalive_task
+                except asyncio.CancelledError:
+                    pass
         print("Disconnecting...")
 
 
-def main():
-    addr_or_name = None
-    if len(sys.argv) > 1:
-        addr_or_name = sys.argv[1]
-    asyncio.run(run_hid_client(addr_or_name))
+async def run_hid_client_with_reconnect(
+    address_or_name: Optional[str] = None,
+    *,
+    reconnect_delay: float = 3.0,
+    keepalive_interval: float = 0,
+    keepalive_mode: str = "battery",
+) -> None:
+    """
+    Run the HID client indefinitely, reconnecting after disconnect.
+
+    reconnect_delay: seconds to wait before reconnecting (default 3).
+    keepalive_interval: seconds between keepalive reads (0 = disabled).
+    keepalive_mode: which characteristic to use for keepalive (battery, read-report, vendor).
+    """
+    target = address_or_name if address_or_name else DEFAULT_DEVICE_ADDRESS
+    while True:
+        try:
+            await run_hid_client(
+                address_or_name,
+                keepalive_interval=keepalive_interval,
+                keepalive_mode=keepalive_mode,
+            )
+        except asyncio.CancelledError:
+            raise
+        except (BleakError, asyncio.TimeoutError, OSError, ConnectionError) as e:
+            print(f"Disconnected: {e}")
+            print(f"Will retry in {reconnect_delay} seconds...")
+            await asyncio.sleep(reconnect_delay)
+        except KeyboardInterrupt:
+            raise
+        else:
+            # run_hid_client returned normally (e.g. device not found); still retry
+            print(f"Connection ended. Will retry in {reconnect_delay} seconds...")
+            await asyncio.sleep(reconnect_delay)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="HID over GATT client with battery, optional keepalive, and auto-reconnect."
+    )
+    parser.add_argument(
+        "device",
+        nargs="?",
+        default=None,
+        help="BLE address (AA:BB:CC:DD:EE:FF) or device name. Default: %(default)s",
+    )
+    parser.add_argument(
+        "--reconnect-delay",
+        type=float,
+        default=float(os.environ.get("RING_BLE_RECONNECT_DELAY", "3")),
+        help="Seconds to wait before reconnecting after disconnect (default: 3, env: RING_BLE_RECONNECT_DELAY)",
+    )
+    parser.add_argument(
+        "--keepalive-interval",
+        type=float,
+        default=float(os.environ.get("RING_BLE_KEEPALIVE_INTERVAL", "0")),
+        help="Seconds between keepalive reads; 0 = disabled (default, env: RING_BLE_KEEPALIVE_INTERVAL)",
+    )
+    parser.add_argument(
+        "--keepalive-mode",
+        choices=["battery", "read-report", "vendor"],
+        default=os.environ.get("RING_BLE_KEEPALIVE_MODE", "battery"),
+        help="Characteristic to use for keepalive (default: battery, env: RING_BLE_KEEPALIVE_MODE)",
+    )
+    args = parser.parse_args()
+
+    asyncio.run(
+        run_hid_client_with_reconnect(
+            args.device,
+            reconnect_delay=args.reconnect_delay,
+            keepalive_interval=args.keepalive_interval,
+            keepalive_mode=args.keepalive_mode,
+        )
+    )
 
 
 if __name__ == "__main__":

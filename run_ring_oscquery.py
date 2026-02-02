@@ -8,14 +8,18 @@ as OSCQuery nodes so clients can discover and read them via OSCQuery only.
 
 Usage:
   pip install -r requirements.txt
-  python run_ring_oscquery.py                    # connect to default device
+  python run_ring_oscquery.py                    # connect to default device (auto-reconnect)
   python run_ring_oscquery.py AA:BB:CC:DD:EE:FF  # connect by address
   python run_ring_oscquery.py "My Ring"          # connect by name
+
+  Env: RING_BLE_RECONNECT_DELAY, RING_BLE_KEEPALIVE_INTERVAL, RING_BLE_KEEPALIVE_MODE
+  (same as main.py; see main.py --help for defaults).
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 import sys
 
@@ -116,9 +120,20 @@ def main():
     if len(sys.argv) > 1:
         addr_or_name = sys.argv[1]
 
+    reconnect_delay = float(os.environ.get("RING_BLE_RECONNECT_DELAY", "3"))
+    keepalive_interval = float(os.environ.get("RING_BLE_KEEPALIVE_INTERVAL", "0"))
+    keepalive_mode = os.environ.get("RING_BLE_KEEPALIVE_MODE", "battery")
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    task = loop.create_task(main_module.run_hid_client(addr_or_name))
+    task = loop.create_task(
+        main_module.run_hid_client_with_reconnect(
+            addr_or_name,
+            reconnect_delay=reconnect_delay,
+            keepalive_interval=keepalive_interval,
+            keepalive_mode=keepalive_mode,
+        )
+    )
 
     def on_sigint():
         print("\nShutting down...")
