@@ -25,10 +25,20 @@ import os
 import signal
 import sys
 
-# Payload indices for the "255, 255" bytes and the byte after (adjust if protocol changes)
+# Payload indices for pointer/touch (adjust if protocol changes)
 IDX_BYTE_10 = 10
 IDX_BYTE_11 = 11
 IDX_BYTE_12 = 12
+
+# IMU: optional parsing from HID report (bytes 0-5 accel XYZ, 6-11 gyro XYZ as int16 LE). Set REPORT_MIN_LEN_FOR_IMU to 0 to disable.
+ACCEL_START = 0
+ACCEL_BYTES = 6  # 3 x int16 LE
+GYRO_START = 6
+GYRO_BYTES = 6   # 3 x int16 LE
+REPORT_MIN_LEN_FOR_IMU = 12  # need at least 12 bytes to parse accel + gyro
+# Scale: int16 LSB to physical (e.g. 16384 = 1g for accel; adjust per device)
+IMU_ACCEL_SCALE = 1.0 / 16384.0
+IMU_GYRO_SCALE = 1.0 / 16384.0
 
 HTTP_PORT = 9020
 OSC_PORT = 9020
@@ -54,10 +64,31 @@ def _create_oscquery_service_and_nodes():
     node_battery = OSCQueryNode(
         full_path="/ring/battery", value=[0], type_=[int], access=OSCAccess.READWRITE_VALUE
     )
-    for node in (node_x, node_y, node_press, node_battery):
+    nodes = [node_x, node_y, node_press, node_battery]
+    # IMU (optional): accel/gyro from HID report bytes 0-11 when report length >= REPORT_MIN_LEN_FOR_IMU
+    if REPORT_MIN_LEN_FOR_IMU > 0:
+        for name in ("accel_x", "accel_y", "accel_z", "gyro_x", "gyro_y", "gyro_z"):
+            nodes.append(
+                OSCQueryNode(
+                    full_path=f"/ring/{name}",
+                    value=[0.0],
+                    type_=[float],
+                    access=OSCAccess.READWRITE_VALUE,
+                )
+            )
+    for node in nodes:
         service.add_node(node)
 
     return service
+
+
+def _parse_int16_le(data: bytearray, offset: int) -> int:
+    """Parse int16 little-endian from data at offset; return 0 if out of range."""
+    if offset + 2 > len(data):
+        return 0
+    low, high = data[offset], data[offset + 1]
+    v = low | (high << 8)
+    return v - 65536 if v >= 32768 else v
 
 
 def _make_notification_wrapper(original_handler, service, debug=False):
@@ -65,9 +96,28 @@ def _make_notification_wrapper(original_handler, service, debug=False):
 
     def wrapper(characteristic, data: bytearray):
         original_handler(characteristic, data)
+        # IMU: parse accel/gyro from first 12 bytes when report is long enough
+        if REPORT_MIN_LEN_FOR_IMU > 0 and len(data) >= REPORT_MIN_LEN_FOR_IMU:
+            try:
+                ax = _parse_int16_le(data, ACCEL_START + 0) * IMU_ACCEL_SCALE
+                ay = _parse_int16_le(data, ACCEL_START + 2) * IMU_ACCEL_SCALE
+                az = _parse_int16_le(data, ACCEL_START + 4) * IMU_ACCEL_SCALE
+                gx = _parse_int16_le(data, GYRO_START + 0) * IMU_GYRO_SCALE
+                gy = _parse_int16_le(data, GYRO_START + 2) * IMU_GYRO_SCALE
+                gz = _parse_int16_le(data, GYRO_START + 4) * IMU_GYRO_SCALE
+                service.update_value("/ring/accel_x", ax)
+                service.update_value("/ring/accel_y", ay)
+                service.update_value("/ring/accel_z", az)
+                service.update_value("/ring/gyro_x", gx)
+                service.update_value("/ring/gyro_y", gy)
+                service.update_value("/ring/gyro_z", gz)
+            except Exception as e:
+                if debug:
+                    print(f"[OSCQuery] IMU parse failed: {e}")
+        # Pointer/touch: bytes 10, 11, 12
         if len(data) <= IDX_BYTE_12:
             if debug:
-                print(f"[OSCQuery] Skipped update: len(data)={len(data)} (need > {IDX_BYTE_12})")
+                print(f"[OSCQuery] Skipped pointer update: len(data)={len(data)} (need > {IDX_BYTE_12})")
             return
         x_val = data[IDX_BYTE_10]
         y_val = data[IDX_BYTE_11]
@@ -115,7 +165,10 @@ def main():
         print(f"WebSocket on same port (OSCQuery spec): ws://127.0.0.1:{_service.wsPort} — use LISTEN to get live updates")
     else:
         print(f"WebSocket for live value updates: ws://127.0.0.1:{_service.wsPort} (in HOST_INFO)")
-    print("Ring nodes: /ring/X, /ring/Y, /ring/press, /ring/battery")
+    ring_nodes = "/ring/X, /ring/Y, /ring/press, /ring/battery"
+    if REPORT_MIN_LEN_FOR_IMU > 0:
+        ring_nodes += ", /ring/accel_x, /ring/accel_y, /ring/accel_z, /ring/gyro_x, /ring/gyro_y, /ring/gyro_z"
+    print(f"Ring nodes: {ring_nodes}")
     original_handler = main_module.notification_handler
     main_module.notification_handler = _make_notification_wrapper(original_handler, _service)
 
@@ -160,6 +213,27 @@ def main():
         default=float(os.environ.get("RING_BLE_BATTERY_POLL_INTERVAL", "60")),
         help="Seconds between battery reads; 0 = disabled (default: 60, env: RING_BLE_BATTERY_POLL_INTERVAL)",
     )
+    parser.add_argument(
+        "--gatt-dump",
+        type=str,
+        default=os.environ.get("RING_BLE_GATT_DUMP_FILE", ""),
+        metavar="FILE",
+        help="Write full GATT tree to FILE on connect (env: RING_BLE_GATT_DUMP_FILE)",
+    )
+    parser.add_argument(
+        "--write-ae41",
+        type=str,
+        default=None,
+        metavar="HEX",
+        help="On connect (vendor path), write HEX to char 0xAE41 (e.g. 01). No spaces.",
+    )
+    parser.add_argument(
+        "--write-fff2",
+        type=str,
+        default=None,
+        metavar="HEX",
+        help="On connect (vendor path), write HEX to char 0xFFF2 (e.g. 01). No spaces.",
+    )
     args = parser.parse_args()
 
     addr_or_name = args.device
@@ -167,6 +241,9 @@ def main():
     keepalive_interval = args.keepalive_interval
     keepalive_mode = args.keepalive_mode
     battery_poll_interval = args.battery_poll_interval
+    gatt_dump_file = args.gatt_dump or None
+    write_ae41_hex = args.write_ae41
+    write_fff2_hex = args.write_fff2
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -178,6 +255,9 @@ def main():
             keepalive_mode=keepalive_mode,
             battery_poll_interval=battery_poll_interval,
             on_battery_updated=_on_battery_updated,
+            gatt_dump_file=gatt_dump_file,
+            write_ae41_hex=write_ae41_hex,
+            write_fff2_hex=write_fff2_hex,
         )
     )
 
